@@ -1,0 +1,25 @@
+name: DevOps Agent QA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  devops-agent-qa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Release Tests
+        uses: aws-actions/devops-agent-qa@v1
+        with:
+          webhook-url: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
+          webhook-secret: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
+          test-profile-id: ki-60548fd2-e150-4183-a05b-efee743647b7
+          # test-requirement: <OPTIONAL_FOCUS_AREA>
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
