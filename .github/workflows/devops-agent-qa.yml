@@ -1,4 +1,4 @@
-name: DevOps Agent QA
+name: Vercel - coffee-blend: release-testing
 
 on:
   push:
@@ -9,6 +9,8 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  checks: write
+  statuses: write
 
 jobs:
   devops-agent-qa:
