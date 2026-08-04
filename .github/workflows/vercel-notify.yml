@@ -3,6 +3,8 @@ name: notify vercel
 on:
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   notify-vercel:
     runs-on: ubuntu-latest
