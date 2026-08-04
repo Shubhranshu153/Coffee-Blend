@@ -19,7 +19,7 @@ jobs:
         with:
           webhook-url: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
           webhook-secret: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
-          test-profile-id: <YOUR_TEST_PROFILE_ID>
+          test-profile-id: ki-60548fd2-e150-4183-a05b-efee743647b7
           # test-requirement: <OPTIONAL_FOCUS_AREA>
         env:
           GITHUB_TOKEN: ${{ github.token }}
