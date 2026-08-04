@@ -1,21 +1,60 @@
-name: Vercel - coffee-blend: release-testing
+name: "Vercel Release Testing"
+
+# Gates Vercel production promotion on the AWS DevOps Release Testing Agent.
+#
+# Why repository_dispatch and not push/pull_request:
+#   Vercel holds a production deployment before aliasing it, and dispatches
+#   'vercel.deployment.ready' at that point. It is the only pre-promotion event —
+#   'vercel.deployment.success' and '.promoted' both fire after promotion, so
+#   gating on them is a no-op.
+#
+# STAGE 1: the last step is a diagnostic. The Release Testing Agent creates its
+# check run asynchronously from the AgentSpace (this workflow only signs a
+# webhook), so we do not yet know that check's name or app slug. The diagnostic
+# prints them; Stage 2 replaces it with a poll that blocks on the result.
+#
+# Until then this reports success as soon as the webhook is delivered — it gates
+# on delivery, NOT on tests passing. Do not register the Deployment Check as
+# required until Stage 2 lands.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  repository_dispatch:
+    types: ['vercel.deployment.ready']
 
-permissions:
-  contents: read
-  pull-requests: read
-  checks: write
-  statuses: write
+run-name: >-
+  Release Testing - ${{ github.event.client_payload.project.name }}
+  (${{ github.event.client_payload.environment }})
 
 jobs:
-  devops-agent-qa:
+  release-testing:
+    # TestProfile ki-60548fd2 targets the production domain, so preview
+    # deployments would test the wrong URL. The QA action takes no target-URL
+    # input, so restricting the trigger is the only lever.
+    #
+    # Both casings are accepted: the dispatch payload types `environment` as a
+    # bare string, and while the documented example is 'production', GitHub's
+    # deployments API reports this repo's environments capitalized. A case
+    # mismatch here would silently skip the job. The echo-payload job below
+    # records the real value; once confirmed, collapse this to one comparison.
+    if: ${{ github.event.client_payload.environment == 'production' || github.event.client_payload.environment == 'Production' }}
     runs-on: ubuntu-latest
+    permissions:
+      actions: read # actions/status calls listJobsForWorkflowRun
+      statuses: write # actions/status calls createCommitStatus
+      checks: read # read the agent's check run
+      contents: read
+      pull-requests: read # QA action resolves the PR from the commit
+
     steps:
+      # Writes a 'pending' commit status now, and a success/failure status in its
+      # post step once the job finishes. The explicit name is the exact string to
+      # register under Vercel's Deployment Checks; the default would be
+      # "<workflow> | <job> (project - environment)".
+      - name: Report pending status to Vercel
+        uses: vercel/repository-dispatch/actions/status@v1
+        with:
+          name: "Vercel - coffee-blend: release-testing"
+
       - name: Trigger Release Tests
         uses: aws-actions/devops-agent-qa@v1
         with:
@@ -25,3 +64,51 @@ jobs:
           # test-requirement: <OPTIONAL_FOCUS_AREA>
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+      # STAGE 1 DIAGNOSTIC — delete once Stage 2 is wired.
+      # Captures the agent's check-run name + app slug so the Stage 2 poll can
+      # match on them. Also surfaces a known SHA hazard: actions/status reads
+      # client_payload.git.sha (the deployed commit), but the QA action above
+      # falls back to context.sha, which under repository_dispatch is
+      # default-branch HEAD. If the agent's check lands on a different commit
+      # than the deployed one, the gate can never satisfy and it must be raised
+      # upstream with aws-actions/devops-agent-qa.
+      - name: Observe check runs on the deployed commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.client_payload.git.sha }}
+          CONTEXT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "deployed sha (client_payload.git.sha): $SHA"
+          echo "workflow context sha (github.sha):     $CONTEXT_SHA"
+          if [ "$SHA" != "$CONTEXT_SHA" ]; then
+            echo "::warning::SHA mismatch - the QA action may attach its check to $CONTEXT_SHA instead of $SHA"
+          fi
+
+          echo "waiting 90s for the AgentSpace to create its check run..."
+          sleep 90
+
+          for entry in "deployed:$SHA" "context:$CONTEXT_SHA"; do
+            label="${entry%%:*}"
+            sha="${entry##*:}"
+            echo "--- check runs on $label commit ($sha) ---"
+            gh api "repos/${{ github.repository }}/commits/$sha/check-runs" \
+              --jq '.check_runs[] | "name=\(.name) app=\(.app.slug) status=\(.status) conclusion=\(.conclusion)"' \
+              || echo "(query failed)"
+          done
+
+  # STAGE 1 DIAGNOSTIC JOB — delete along with the step above.
+  # Runs unconditionally so that if the environment guard on release-testing
+  # skips (a wrong-case or unexpected value), we still learn what the payload
+  # actually contained instead of seeing an empty run and guessing.
+  echo-payload:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Dump dispatch payload
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          echo "action type: ${{ github.event.action }}"
+          echo "$PAYLOAD"
