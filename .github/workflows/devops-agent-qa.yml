@@ -1,0 +1,13 @@
+name: DevOps Agent QA
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  devops-agent-qa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run DevOps Agent QA
+        uses: aws-actions/devops-agent-qa@main
