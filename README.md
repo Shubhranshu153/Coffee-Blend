@@ -121,3 +121,6 @@ All rights reserved.
 ## 📝 Final Note
 
 **Coffee Blend** represents a completed client engagement and demonstrates professional frontend development with **branding, online ordering, and payment integration** for a real-world coffee business.
+
+<!-- dev branch tracked by Vercel for pre-release UAT (Release Testing agent). -->
+
