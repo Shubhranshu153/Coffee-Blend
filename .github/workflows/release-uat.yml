@@ -1,0 +1,157 @@
+name: "Release UAT"
+
+# Release-time full UAT gate.
+#
+# Mental model: releasing is a deliberate, infrequent act — NOT something that
+# happens on every commit to main. Commits to main only BUILD production
+# deployments (with automatic production aliasing turned OFF in Vercel, they do
+# not go live). This workflow runs the full QA UAT once, when you cut a release,
+# and only promotes the build to production if UAT passes.
+#
+# Triggers:
+#   - push a version tag  v*   (the release event)
+#   - schedule (cron)           periodic UX monitoring against staging, no promote
+#   - workflow_dispatch         manual re-run / dry-run
+#
+# PREREQUISITE in Vercel: Settings -> Environments -> Production ->
+# automatic aliasing OFF. Otherwise main commits self-promote and this gate is
+# bypassed. (This is the opposite of the Deployment-Checks setup; here the
+# workflow owns promotion, so Vercel must not auto-promote.)
+
+on:
+  push:
+    tags: ['v*']
+  schedule:
+    - cron: '0 7 * * *' # 07:00 UTC daily UX monitoring run (staging, no promote)
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: "Promote to production if UAT passes"
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-uat
+  cancel-in-progress: false # never interrupt an in-flight release
+
+jobs:
+  uat:
+    runs-on: ubuntu-latest
+    environment: Production # webhook + Vercel secrets are scoped here
+
+    permissions:
+      checks: read # poll the agent's result check run
+      contents: read
+      statuses: write
+
+    steps:
+      # The commit the UAT verdict is recorded against. On a tag this is the
+      # tagged commit; on schedule/manual it is the branch HEAD the workflow ran
+      # on. The agent posts its check run on this SHA.
+      - name: Resolve target commit
+        id: target
+        run: |
+          echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          # Whether this run is allowed to promote: only tag pushes, or a manual
+          # run with promote=true. Scheduled runs are monitoring-only.
+          if [ "${{ github.event_name }}" = "push" ] \
+             || { [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+                  && [ "${{ inputs.promote }}" = "true" ]; }; then
+            echo "may_promote=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "may_promote=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record QA trigger time
+        run: echo "QA_TRIGGER_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
+
+      # Fire the agent. It tests the STATIC staging alias configured in
+      # TestProfile ki-60548fd2 (coffee-blend-git-staging-…vercel.app), which is
+      # stable and always serves the staging branch's latest build. The action
+      # sends no URL; the target lives in the profile.
+      - name: Trigger Release Tests
+        uses: aws-actions/devops-agent-qa@v1
+        with:
+          webhook-url: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
+          webhook-secret: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
+          test-profile-id: ki-60548fd2-e150-4183-a05b-efee743647b7
+          test-requirement: "Full UAT pass across the site."
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Same fail-closed poller as the PR/dispatch workflow: match the DevOps
+      # Agent App by stable slug, ignore stale checks from earlier runs on this
+      # SHA, exit 1 on anything but an explicit pass or on timeout.
+      - name: Wait for UAT result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AGENT_SHA: ${{ steps.target.outputs.sha }}
+          AGENT_APP: aws-devops-agent-us-east-1
+          POLL_INTERVAL: "15"
+          TIMEOUT_SECONDS: "3600" # 60 min — full UAT is slower than a scoped run
+        run: |
+          set -euo pipefail
+          floor=$(( QA_TRIGGER_EPOCH - 120 ))
+          echo "target sha:        $AGENT_SHA"
+          echo "matching app slug: $AGENT_APP"
+          deadline=$(( SECONDS + TIMEOUT_SECONDS ))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            resp=$(timeout 60 gh api \
+              "repos/$REPO/commits/$AGENT_SHA/check-runs?per_page=100" 2>/dev/null || true)
+            run_json=""
+            if [ -n "$resp" ]; then
+              run_json=$(printf '%s' "$resp" | jq -c \
+                --arg app "$AGENT_APP" --argjson since "$floor" '
+                [ .check_runs[]?
+                  | select(.app.slug == $app)
+                  | select((.started_at | fromdateiso8601) >= $since) ]
+                | sort_by(.started_at) | last // empty')
+            fi
+            if [ -z "$run_json" ]; then
+              echo "[$(date -u +%H:%M:%S)] no UAT check yet; waiting ${POLL_INTERVAL}s"
+              sleep "$POLL_INTERVAL"; continue
+            fi
+            name=$(printf '%s' "$run_json" | jq -r '.name')
+            status=$(printf '%s' "$run_json" | jq -r '.status')
+            conclusion=$(printf '%s' "$run_json" | jq -r '.conclusion // "null"')
+            echo "[$(date -u +%H:%M:%S)] $name: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              case "$conclusion" in
+                success|neutral|skipped) echo "::notice::UAT PASSED ($conclusion)"; exit 0 ;;
+                *) echo "::error::UAT FAILED (conclusion=$conclusion)"; exit 1 ;;
+              esac
+            fi
+            sleep "$POLL_INTERVAL"
+          done
+          echo "::error::Timed out after ${TIMEOUT_SECONDS}s waiting for UAT on $AGENT_SHA"
+          exit 1
+
+      # Only reached if UAT passed (the poller exits non-zero otherwise, failing
+      # the job before this step). Promotes the ALREADY-BUILT production
+      # deployment for this commit — no rebuild. Skipped for scheduled/monitoring
+      # runs.
+      - name: Promote to production
+        if: steps.target.outputs.may_promote == 'true'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Find the production deployment built from this commit. Vercel stamps
+          # deployments with githubCommitSha in their meta.
+          dep=$(npx --yes vercel@latest list \
+            --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID" \
+            --meta githubCommitSha="$SHA" --prod --yes 2>/dev/null \
+            | grep -oE 'https://[a-zA-Z0-9.-]+\.vercel\.app' | head -1 || true)
+
+          if [ -z "$dep" ]; then
+            echo "::error::No production deployment found for commit $SHA. Ensure main built a production deployment (auto-aliasing OFF) before tagging."
+            exit 1
+          fi
+          echo "promoting $dep to production"
+          npx --yes vercel@latest promote "$dep" \
+            --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID" --yes
+          echo "::notice::Promoted $dep to production after UAT pass"
