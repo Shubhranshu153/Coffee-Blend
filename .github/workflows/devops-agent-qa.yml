@@ -1,21 +1,87 @@
-name: Vercel - coffee-blend: release-testing
+name: "Vercel Release Testing"
+
+# Gates on the AWS DevOps Release Testing Agent on two paths:
+#
+#   pull_request         -> the job's own "release-testing" check run reflects
+#                           the QA verdict, so a branch-protection rule can block
+#                           the merge. Runs from the PR branch, so it is testable
+#                           before merge.
+#
+#   repository_dispatch  -> 'vercel.deployment.ready' is the only event Vercel
+#                           sends BEFORE promoting a production deployment. The
+#                           actions/status post-step writes the QA verdict to the
+#                           stable status "Vercel - coffee-blend: release-testing",
+#                           which Vercel holds production promotion on.
+#
+# How the gate actually works (Stage 2):
+#   The QA action is fire-and-forget: it signs a webhook and returns. The DevOps
+#   Agent GitHub App (app slug 'aws-devops-agent-us-east-1') then creates a check
+#   run named "QA Agent #<timestamp>" on the tested commit and updates it when
+#   tests finish. That name changes every run, so it cannot be gated on directly.
+#   The "Wait for QA Agent result" step below polls for that app's check run and
+#   mirrors its conclusion into this job's exit code. THAT is the bridge from the
+#   agent's dynamic check name to our two stable gate surfaces above.
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
-
-permissions:
-  contents: read
-  pull-requests: read
-  checks: write
-  statuses: write
+  repository_dispatch:
+    types: ['vercel.deployment.ready']
 
 jobs:
-  devops-agent-qa:
+  release-testing:
+    # PRs always run. Dispatches only run for production, because the QA action
+    # accepts no target-URL input: the URL under test comes from TestProfile
+    # ki-60548fd2, which points at the production domain, so a preview dispatch
+    # would test the wrong thing.
+    #
+    # Both casings are accepted for the dispatch payload's `environment`, which
+    # is typed as a bare string: Vercel's docs example is lowercase
+    # 'production', but this repo's GitHub environments are capitalized. A case
+    # mismatch would silently skip the job; the echo-payload job records the
+    # real value so this can be collapsed to one comparison once confirmed on a
+    # real dispatch run (we have only observed pull_request runs so far).
+    if: >-
+      ${{ github.event_name == 'pull_request'
+          || github.event.client_payload.environment == 'production'
+          || github.event.client_payload.environment == 'Production' }}
     runs-on: ubuntu-latest
+
+    # DEVOPS_AGENT_WEBHOOK_URL/SECRET are environment secrets scoped to
+    # Production, not repo-level secrets, so the job cannot see them without
+    # this. Production currently has no protection rules; if required reviewers
+    # are ever added, every PR run will block awaiting approval. Moving the two
+    # secrets to repo level would remove that coupling.
+    environment: Production
+
+    permissions:
+      actions: read # actions/status calls listJobsForWorkflowRun
+      statuses: write # actions/status calls createCommitStatus
+      checks: read # poll the agent's result check run
+      contents: read
+      pull-requests: read # QA action resolves the PR from the commit
+
     steps:
+      # Dispatch path only. Writes a 'pending' status now and, via its post step,
+      # a success/failure status keyed to this job's conclusion. It writes to
+      # client_payload.git.sha (the held production commit) — exactly the commit
+      # Vercel evaluates. On pull_request it would target the ephemeral merge
+      # commit, so the PR path relies on the job's own check run instead.
+      - name: Report pending status to Vercel
+        if: github.event_name == 'repository_dispatch'
+        uses: vercel/repository-dispatch/actions/status@v1
+        with:
+          name: "Vercel - coffee-blend: release-testing"
+
+      # Recorded BEFORE triggering so the poller can ignore any stale agent check
+      # run left on this SHA by a previous run (common on PR reruns). Anything the
+      # agent starts for THIS trigger has started_at >= this epoch.
+      - name: Record QA trigger time
+        run: echo "QA_TRIGGER_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
+
+      # On pull_request the action uses pull_request.head.sha; on dispatch it
+      # falls back to context.sha (default-branch HEAD). Either way the agent's
+      # check run lands on that same SHA — see AGENT_SHA in the poller.
       - name: Trigger Release Tests
         uses: aws-actions/devops-agent-qa@v1
         with:
@@ -25,3 +91,84 @@ jobs:
           # test-requirement: <OPTIONAL_FOCUS_AREA>
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+      # STAGE 2 GATE. Polls the tested commit for the DevOps Agent App's check
+      # run and fails closed: exit 0 only on an explicit pass, exit 1 on any
+      # failure/cancel/timeout. No job-level timeout-minutes on purpose — a
+      # cancelled job would let actions/status report success (it maps only
+      # 'failure' step conclusions to a failed status). The script's own bounded
+      # exit 1 is what makes a stall BLOCK rather than silently promote.
+      - name: Wait for QA Agent result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # PR head on pull_request; context.sha (main HEAD) on dispatch — the
+          # exact SHA the QA action sends and the agent posts its check run on.
+          AGENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          AGENT_APP: aws-devops-agent-us-east-1
+          POLL_INTERVAL: "15"
+          TIMEOUT_SECONDS: "1800" # 30 min
+        run: |
+          set -euo pipefail
+          floor=$(( QA_TRIGGER_EPOCH - 120 )) # clock-skew buffer
+          echo "event:              ${{ github.event_name }}"
+          echo "agent sha:          $AGENT_SHA"
+          echo "matching app slug:  $AGENT_APP"
+          echo "ignoring agent checks started before epoch: $floor"
+
+          deadline=$(( SECONDS + TIMEOUT_SECONDS ))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            resp=$(timeout 60 gh api \
+              "repos/$REPO/commits/$AGENT_SHA/check-runs?per_page=100" 2>/dev/null || true)
+
+            run_json=""
+            if [ -n "$resp" ]; then
+              run_json=$(printf '%s' "$resp" | jq -c \
+                --arg app "$AGENT_APP" --argjson since "$floor" '
+                [ .check_runs[]?
+                  | select(.app.slug == $app)
+                  | select((.started_at | fromdateiso8601) >= $since) ]
+                | sort_by(.started_at) | last // empty')
+            fi
+
+            if [ -z "$run_json" ]; then
+              echo "[$(date -u +%H:%M:%S)] no QA Agent check run yet; waiting ${POLL_INTERVAL}s"
+              sleep "$POLL_INTERVAL"; continue
+            fi
+
+            name=$(printf '%s' "$run_json" | jq -r '.name')
+            status=$(printf '%s' "$run_json" | jq -r '.status')
+            conclusion=$(printf '%s' "$run_json" | jq -r '.conclusion // "null"')
+            echo "[$(date -u +%H:%M:%S)] $name: status=$status conclusion=$conclusion"
+
+            if [ "$status" = "completed" ]; then
+              case "$conclusion" in
+                success|neutral|skipped)
+                  echo "::notice::QA Agent gate PASSED ($conclusion)"; exit 0 ;;
+                *)
+                  echo "::error::QA Agent gate FAILED (conclusion=$conclusion)"; exit 1 ;;
+              esac
+            fi
+            sleep "$POLL_INTERVAL"
+          done
+
+          echo "::error::Timed out after ${TIMEOUT_SECONDS}s waiting for QA Agent result on $AGENT_SHA"
+          exit 1
+
+  # DIAGNOSTIC JOB — safe to delete once a real repository_dispatch run has
+  # confirmed the payload's `environment` casing. Runs unconditionally so that if
+  # the guard on release-testing skips, we still see what the payload contained
+  # instead of an empty run. We have only observed pull_request runs so far, so
+  # the dispatch-path environment value is still unverified.
+  echo-payload:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Dump event context
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          echo "event:       ${{ github.event_name }}"
+          echo "action type: ${{ github.event.action }}"
+          echo "client_payload (empty on pull_request):"
+          echo "$PAYLOAD"
