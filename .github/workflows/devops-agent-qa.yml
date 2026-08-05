@@ -1,45 +1,82 @@
 name: "Vercel Release Testing"
 
-# PR merge-time check (the FAST, scoped one). Full UAT happens separately at
-# release time — see release-uat.yml.
+# QA gate on two surfaces:
 #
-# On a pull_request, the QA action tests the target in TestProfile ki-60548fd2
-# and the DevOps Agent GitHub App (slug 'aws-devops-agent-us-east-1') posts a
-# check run named "QA Agent #<timestamp>" on the PR head. That name changes
-# every run, so the poller below matches the stable app slug instead and mirrors
-# the verdict into this job's "release-testing" check — which a branch-protection
-# rule on main can require, blocking merge until it passes.
+#   pull_request         -> the job's own "release-testing" check run on the PR
+#                           head; a branch-protection rule on main requires it,
+#                           blocking merge until QA passes.
 #
-# The old repository_dispatch/production-promotion path was removed: production
-# promotion is now gated at release time by release-uat.yml (with Vercel
-# automatic aliasing OFF), so gating every prod deploy here would only
-# reintroduce the per-deploy hold we set out to avoid.
+#   repository_dispatch  -> on vercel.deployment.ready (preview OR production),
+#                           actions/status writes an ENVIRONMENT-SCOPED commit
+#                           status that Vercel Deployment Checks hold on:
+#                             "Vercel - coffee-blend: <env>: release-testing"
+#                           Env in the name is required so preview and production
+#                           runs don't overwrite each other's status, and so each
+#                           can be registered as a separate Deployment Check.
+#
+# SHA bridge (important): on repository_dispatch the QA action posts the agent's
+# check run on github.sha (default-branch HEAD), while actions/status writes the
+# gate status on client_payload.git.sha (the actual deployed commit Vercel
+# evaluates). Those differ for preview. The poller therefore watches github.sha
+# (where the agent posts) and sets the JOB conclusion; actions/status's post-step
+# then mirrors that conclusion onto the deployed commit. The job conclusion — not
+# a shared SHA — is the bridge.
+#
+# Full-site UAT at release time lives in release-uat.yml (tag/cron/manual).
 
 on:
   pull_request:
     branches: [main]
+  repository_dispatch:
+    types: ['vercel.deployment.ready']
 
 jobs:
   release-testing:
+    # Run for PRs and for any Vercel deployment dispatch (preview or production).
+    # Casing tolerated: the dispatch payload types `environment` as a bare string
+    # ('production' observed lowercase; preview assumed 'preview').
+    if: >-
+      ${{ github.event_name == 'pull_request'
+          || github.event.client_payload.environment == 'preview'
+          || github.event.client_payload.environment == 'Preview'
+          || github.event.client_payload.environment == 'production'
+          || github.event.client_payload.environment == 'Production' }}
     runs-on: ubuntu-latest
 
     # DEVOPS_AGENT_WEBHOOK_URL/SECRET are environment secrets scoped to
-    # Production. Production currently has no protection rules; if required
-    # reviewers are ever added, every PR run will block awaiting approval.
-    # Moving the two secrets to repo level would remove that coupling.
+    # Production. If required reviewers are added to that GitHub environment,
+    # every run will block on approval; move the secrets to repo level to decouple.
     environment: Production
 
     permissions:
+      actions: read # actions/status -> listJobsForWorkflowRun
+      statuses: write # actions/status -> createCommitStatus
       checks: read # poll the agent's result check run
       contents: read
       pull-requests: read # QA action resolves the PR from the commit
 
     steps:
+      # Dispatch only. Writes a PENDING status now and (via its post step) a
+      # success/failure status keyed to the job conclusion, on
+      # client_payload.git.sha — the exact commit Vercel is evaluating. The name
+      # embeds the environment so preview and production are distinct checks.
+      # On pull_request this is skipped; that path relies on the job's own
+      # "release-testing" check run instead.
+      - name: Report pending status to Vercel
+        if: github.event_name == 'repository_dispatch'
+        uses: vercel/repository-dispatch/actions/status@v1
+        with:
+          name: "Vercel - coffee-blend: ${{ github.event.client_payload.environment }}: release-testing"
+
       - name: Record QA trigger time
         run: echo "QA_TRIGGER_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
 
-      # Scoped to the menu view to keep the merge check fast (the agent is slow
-      # when exploring the whole site). Full-site UAT is release-uat.yml's job.
+      # Scoped to the menu view to keep this fast (the agent is slow full-site).
+      # Tests the static URL in TestProfile ki-60548fd2 (the dev/preview alias);
+      # the action sends no per-deployment URL. NOTE: a production dispatch would
+      # therefore also be tested against that same static URL — acceptable only
+      # because the profile is static; revisit if production must test its own
+      # build. Full-site UAT is release-uat.yml.
       - name: Trigger Release Tests
         uses: aws-actions/devops-agent-qa@v1
         with:
@@ -50,22 +87,25 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
-      # Fail-closed poller: match the DevOps Agent App by stable slug, ignore
-      # stale checks left on this SHA by earlier runs (started_at >= trigger
-      # time), exit 1 on any non-pass conclusion or on timeout. No job-level
-      # timeout-minutes on purpose, so a stall blocks the merge rather than
-      # silently passing.
+      # Fail-closed poller. Matches the DevOps Agent App by stable slug (its
+      # check name "QA Agent #<ts>" is dynamic), ignores stale checks from
+      # earlier runs on this SHA (started_at >= trigger time), exits 1 on any
+      # non-pass conclusion or on timeout. No job-level timeout-minutes: a stall
+      # must fail the job so the gate blocks rather than silently passing.
       - name: Wait for QA Agent result
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          AGENT_SHA: ${{ github.event.pull_request.head.sha }}
+          # PR head on pull_request; github.sha (default-branch HEAD) on
+          # dispatch — where the QA action makes the agent post its check.
+          AGENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           AGENT_APP: aws-devops-agent-us-east-1
           POLL_INTERVAL: "15"
           TIMEOUT_SECONDS: "1800" # 30 min
         run: |
           set -euo pipefail
           floor=$(( QA_TRIGGER_EPOCH - 120 ))
+          echo "event:             ${{ github.event_name }}"
           echo "agent sha:         $AGENT_SHA"
           echo "matching app slug: $AGENT_APP"
           deadline=$(( SECONDS + TIMEOUT_SECONDS ))
