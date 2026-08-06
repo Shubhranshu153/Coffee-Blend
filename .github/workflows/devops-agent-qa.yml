@@ -27,16 +27,26 @@ name: "Vercel Release Testing"
 on:
   pull_request:
     branches: [main]
+  # Push to the preview branch so the job's own "release-testing" CHECK RUN
+  # concludes on each preview deployment's commit. Vercel's Deployment Checks
+  # picker offers a check per-environment based on the environments it has seen
+  # that check conclude on (this is how a "lint" check gains a preview option).
+  # Without this, dev pushes produced only an orphan commit status and no check
+  # run, so no preview option ever appeared in the picker.
+  push:
+    branches: [dev]
   repository_dispatch:
     types: ['vercel.deployment.ready']
 
 jobs:
   release-testing:
-    # Run for PRs and for any Vercel deployment dispatch (preview or production).
-    # Casing tolerated: the dispatch payload types `environment` as a bare string
-    # ('production' observed lowercase; preview assumed 'preview').
+    # Run for PRs, for dev pushes (to emit the preview check run), and for any
+    # Vercel deployment dispatch (preview or production). Casing tolerated: the
+    # dispatch payload types `environment` as a bare string ('production'
+    # observed lowercase; preview assumed 'preview').
     if: >-
       ${{ github.event_name == 'pull_request'
+          || github.event_name == 'push'
           || github.event.client_payload.environment == 'preview'
           || github.event.client_payload.environment == 'Preview'
           || github.event.client_payload.environment == 'production'
