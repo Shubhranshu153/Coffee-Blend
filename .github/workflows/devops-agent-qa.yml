@@ -37,6 +37,11 @@ on:
     branches: [dev]
   repository_dispatch:
     types: ['vercel.deployment.ready']
+  # Manual lever: fire release-testing on demand. System-triggered events
+  # (repository_dispatch, schedule) create runs reliably here even when push/PR
+  # run-creation or runner pickup is slow, so this is a dependable way to
+  # (re)produce the check on a given ref for Vercel Deployment Checks.
+  workflow_dispatch: {}
 
 jobs:
   release-testing:
@@ -47,6 +52,7 @@ jobs:
     if: >-
       ${{ github.event_name == 'pull_request'
           || github.event_name == 'push'
+          || github.event_name == 'workflow_dispatch'
           || github.event.client_payload.environment == 'preview'
           || github.event.client_payload.environment == 'Preview'
           || github.event.client_payload.environment == 'production'
