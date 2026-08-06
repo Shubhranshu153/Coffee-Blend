@@ -1,0 +1,110 @@
+name: "Release UAT"
+
+# Release-time full UAT run.
+#
+# Mental model: releasing is a deliberate, infrequent act — NOT something that
+# happens on every commit to main. With Vercel's "Auto-assign Custom Production
+# Domains" turned OFF, commits to main only BUILD production deployments (state
+# = Staged); they do not go live. This workflow runs the full QA UAT when you
+# cut a release and reports pass/fail. A human reviews the result and clicks
+# Promote in the Vercel dashboard to go live — Vercel owns promotion, not this
+# workflow.
+#
+# Triggers:
+#   - push a version tag  v*   (the release event)
+#   - schedule (cron)          periodic UX monitoring against staging
+#   - workflow_dispatch        manual on-demand run
+#
+# PREREQUISITE in Vercel: Settings -> Environments -> Production ->
+# disable "Auto-assign Custom Production Domains", so main commits stage rather
+# than self-promote and a human controls go-live after reviewing UAT.
+
+on:
+  push:
+    tags: ['v*']
+  schedule:
+    - cron: '0 7 * * *' # 07:00 UTC daily UX monitoring run
+  workflow_dispatch: {}
+
+concurrency:
+  group: release-uat
+  cancel-in-progress: false # never interrupt an in-flight UAT
+
+jobs:
+  uat:
+    runs-on: ubuntu-latest
+    environment: Production # webhook secrets are scoped here
+
+    permissions:
+      checks: read # poll the agent's result check run
+      contents: read
+
+    steps:
+      - name: Record QA trigger time
+        run: echo "QA_TRIGGER_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
+
+      # Fire the agent. It tests the STATIC staging alias configured in
+      # TestProfile ki-60548fd2 (coffee-blend-git-staging-…vercel.app), which is
+      # stable and always serves the staging branch's latest build. The action
+      # sends no URL; the target lives in the profile.
+      - name: Trigger Release Tests
+        uses: aws-actions/devops-agent-qa@v1
+        with:
+          webhook-url: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
+          webhook-secret: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
+          test-profile-id: ki-60548fd2-e150-4183-a05b-efee743647b7
+          test-requirement: "Full UAT pass across the site."
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Fail-closed poller: match the DevOps Agent App by stable slug, ignore
+      # stale checks left on this SHA by earlier runs (started_at >= trigger
+      # time), exit 1 on any non-pass conclusion or on timeout.
+      #
+      # This run is the release signal a human reads before promoting in Vercel:
+      # green -> safe to click Promote; red -> do not release. The workflow
+      # itself does not promote.
+      - name: Wait for UAT result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AGENT_SHA: ${{ github.sha }}
+          AGENT_APP: aws-devops-agent-us-east-1
+          POLL_INTERVAL: "15"
+          TIMEOUT_SECONDS: "3600" # 60 min — full UAT is slower than a scoped run
+        run: |
+          set -euo pipefail
+          floor=$(( QA_TRIGGER_EPOCH - 120 ))
+          echo "target sha:        $AGENT_SHA"
+          echo "matching app slug: $AGENT_APP"
+          deadline=$(( SECONDS + TIMEOUT_SECONDS ))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            resp=$(timeout 60 gh api \
+              "repos/$REPO/commits/$AGENT_SHA/check-runs?per_page=100" 2>/dev/null || true)
+            run_json=""
+            if [ -n "$resp" ]; then
+              run_json=$(printf '%s' "$resp" | jq -c \
+                --arg app "$AGENT_APP" --argjson since "$floor" '
+                [ .check_runs[]?
+                  | select(.app.slug == $app)
+                  | select((.started_at | fromdateiso8601) >= $since) ]
+                | sort_by(.started_at) | last // empty')
+            fi
+            if [ -z "$run_json" ]; then
+              echo "[$(date -u +%H:%M:%S)] no UAT check yet; waiting ${POLL_INTERVAL}s"
+              sleep "$POLL_INTERVAL"; continue
+            fi
+            name=$(printf '%s' "$run_json" | jq -r '.name')
+            status=$(printf '%s' "$run_json" | jq -r '.status')
+            conclusion=$(printf '%s' "$run_json" | jq -r '.conclusion // "null"')
+            echo "[$(date -u +%H:%M:%S)] $name: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              case "$conclusion" in
+                success|neutral|skipped) echo "::notice::UAT PASSED ($conclusion) — safe to Promote in Vercel"; exit 0 ;;
+                *) echo "::error::UAT FAILED (conclusion=$conclusion) — do not release"; exit 1 ;;
+              esac
+            fi
+            sleep "$POLL_INTERVAL"
+          done
+          echo "::error::Timed out after ${TIMEOUT_SECONDS}s waiting for UAT on $AGENT_SHA"
+          exit 1
