@@ -1,26 +1,19 @@
 name: "Vercel Release Testing"
 
-# QA gate on two surfaces:
+# ONE gate surface: the job's own "release-testing" check run.
 #
-#   pull_request         -> the job's own "release-testing" check run on the PR
-#                           head; a branch-protection rule on main requires it,
-#                           blocking merge until QA passes.
+# The QA action is fire-and-forget; the DevOps Agent App posts a dynamically
+# named "QA Agent #<ts>" check. The poller below mirrors that verdict into THIS
+# job's conclusion, so GitHub publishes a single, stable "release-testing" check
+# run on the commit. That one check is what you require everywhere:
+#   - GitHub branch protection on main  -> gates PR merge
+#   - Vercel Deployment Checks          -> gates preview + production promotion
+#     (register the single check named "release-testing"; it concludes on both
+#      preview commits (dev push / PR) and production commits (main deploy)).
 #
-#   repository_dispatch  -> on vercel.deployment.ready (preview OR production),
-#                           actions/status writes an ENVIRONMENT-SCOPED commit
-#                           status that Vercel Deployment Checks hold on:
-#                             "Vercel - coffee-blend: <env>: release-testing"
-#                           Env in the name is required so preview and production
-#                           runs don't overwrite each other's status, and so each
-#                           can be registered as a separate Deployment Check.
-#
-# SHA bridge (important): on repository_dispatch the QA action posts the agent's
-# check run on github.sha (default-branch HEAD), while actions/status writes the
-# gate status on client_payload.git.sha (the actual deployed commit Vercel
-# evaluates). Those differ for preview. The poller therefore watches github.sha
-# (where the agent posts) and sets the JOB conclusion; actions/status's post-step
-# then mirrors that conclusion onto the deployed commit. The job conclusion — not
-# a shared SHA — is the bridge.
+# We intentionally do NOT write extra "Vercel - coffee-blend: ..." commit
+# statuses; those created duplicate names in Vercel's picker. The one check run
+# covers all paths.
 #
 # Full-site UAT at release time lives in release-uat.yml (tag/cron/manual).
 
@@ -65,25 +58,11 @@ jobs:
     environment: Production
 
     permissions:
-      actions: read # actions/status -> listJobsForWorkflowRun
-      statuses: write # actions/status -> createCommitStatus
       checks: read # poll the agent's result check run
       contents: read
       pull-requests: read # QA action resolves the PR from the commit
 
     steps:
-      # Dispatch only. Writes a PENDING status now and (via its post step) a
-      # success/failure status keyed to the job conclusion, on
-      # client_payload.git.sha — the exact commit Vercel is evaluating. The name
-      # embeds the environment so preview and production are distinct checks.
-      # On pull_request this is skipped; that path relies on the job's own
-      # "release-testing" check run instead.
-      - name: Report pending status to Vercel
-        if: github.event_name == 'repository_dispatch'
-        uses: vercel/repository-dispatch/actions/status@v1
-        with:
-          name: "Vercel - coffee-blend: ${{ github.event.client_payload.environment }}: release-testing"
-
       - name: Record QA trigger time
         run: echo "QA_TRIGGER_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
 
