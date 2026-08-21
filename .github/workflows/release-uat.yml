@@ -52,7 +52,7 @@ jobs:
         with:
           webhook-url: ${{ secrets.DEVOPS_AGENT_WEBHOOK_URL }}
           webhook-secret: ${{ secrets.DEVOPS_AGENT_WEBHOOK_SECRET }}
-          test-profile-id: ki-60548fd2-e150-4183-a05b-efee743647b7
+          test-profile-id: ki-2beca456-cc7a-43c7-936f-5f565d81eaf6
           test-requirement: "Full UAT pass across the site."
         env:
           GITHUB_TOKEN: ${{ github.token }}
