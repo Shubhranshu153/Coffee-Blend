@@ -190,35 +190,38 @@
 	          	<div class="col-md-6">
 	          		<div class="cart-detail ftco-bg-dark p-3 p-md-4">
 	          			<h3 class="billing-heading mb-4">Payment Method</h3>
+								<form class="payment-form" onsubmit="return handlePlaceOrder(event);">
 									<div class="form-group">
 										<div class="col-md-12">
 											<div class="radio">
-											   <label><input type="radio" name="optradio" class="mr-2"> Direct Bank Tranfer</label>
+											   <label><input type="radio" name="paymentmethod" value="bank" class="mr-2"> Direct Bank Tranfer</label>
 											</div>
 										</div>
 									</div>
 									<div class="form-group">
 										<div class="col-md-12">
 											<div class="radio">
-											   <label><input type="radio" name="optradio" class="mr-2"> Check Payment</label>
+											   <label><input type="radio" name="paymentmethod" value="check" class="mr-2"> Check Payment</label>
 											</div>
 										</div>
 									</div>
 									<div class="form-group">
 										<div class="col-md-12">
 											<div class="radio">
-											   <label><input type="radio" name="optradio" class="mr-2"> Paypal</label>
+											   <label><input type="radio" name="paymentmethod" value="paypal" class="mr-2"> Paypal</label>
 											</div>
 										</div>
 									</div>
 									<div class="form-group">
 										<div class="col-md-12">
 											<div class="checkbox">
-											   <label><input type="checkbox" value="" class="mr-2"> I have read and accept the terms and conditions</label>
+											   <label><input type="checkbox" name="acceptterms" value="1" class="mr-2"> I have read and accept the terms and conditions</label>
 											</div>
 										</div>
 									</div>
-									<p><a href="#"class="btn btn-primary py-3 px-4">Place an order</a></p>
+									<p><button type="submit" class="btn btn-primary py-3 px-4">Place an order</button></p>
+									<div class="order-confirmation" role="status" aria-live="polite" style="display:none;"></div>
+								</form>
 								</div>
 	          	</div>
 	          </div>
@@ -448,6 +451,39 @@
 		    
 		});
 	</script>
+
+  <script>
+    // Client-side handler for the checkout "Place an order" button.
+    // The site has no order-submission backend, so the handler validates that
+    // a payment method has been selected and the T&C checkbox is checked, then
+    // renders an in-page confirmation. Returns false so the form does not
+    // navigate away.
+    function handlePlaceOrder(event) {
+      event.preventDefault();
+      var form = event.target;
+      var confirmation = form.querySelector('.order-confirmation');
+      var payment = form.querySelector('input[name="paymentmethod"]:checked');
+      var accepted = form.querySelector('input[name="acceptterms"]:checked');
+
+      if (!payment) {
+        confirmation.style.display = 'block';
+        confirmation.className = 'order-confirmation alert alert-danger mt-3';
+        confirmation.textContent = 'Please select a payment method.';
+        return false;
+      }
+      if (!accepted) {
+        confirmation.style.display = 'block';
+        confirmation.className = 'order-confirmation alert alert-danger mt-3';
+        confirmation.textContent = 'Please accept the terms and conditions to continue.';
+        return false;
+      }
+
+      confirmation.style.display = 'block';
+      confirmation.className = 'order-confirmation alert alert-success mt-3';
+      confirmation.textContent = 'Thank you! Your order has been placed. We will contact you shortly to confirm the details.';
+      return false;
+    }
+  </script>
 
     
   </body>
